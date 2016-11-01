@@ -1,0 +1,202 @@
+#include <cmath>
+#include <iostream>
+
+#include "AutoH1D.h"
+#include "AutoH2D.h"
+#include "AutoH3D.h"
+#include "AutoNtuple.h"
+
+#include "CycledH1D.h"
+#include "CycledH2D.h"
+#include "CycledH3D.h"
+#include "CycledNtuple.h"
+
+#include "Functors.h"
+#include "time_stamp.h"
+
+// Implementation of the class constructor
+template <class Options, class RootMadeClass>
+inline ExampleAnalysis<Options,RootMadeClass>::ExampleAnalysis(
+    TTree *tree, const std::string& outputfile,
+    const std::set<std::string>& histoRequest,
+    const unsigned long maxEvents, const bool verbose,
+    const Options& opts)
+    : RootChainProcessor<RootMadeClass>(tree, maxEvents),
+      options_(opts),
+      verbose_(verbose),
+      manager_(outputfile, histoRequest),
+      totalEnergy_(0.)
+{
+}
+
+
+template <class Options, class RootMadeClass>
+Int_t ExampleAnalysis<Options,RootMadeClass>::Cut(Long64_t /* entry */)
+{
+    // return  1 if entry is accepted.
+    // return -1 otherwise.
+    return 1;
+}
+
+
+template <class Options, class RootMadeClass>
+Bool_t ExampleAnalysis<Options,RootMadeClass>::Notify()
+{
+    // The Notify() function is called when a new file is opened. This
+    // can be either for a new TTree in a TChain or when when a new TTree
+    // is started when using PROOF.
+    if (verbose_)
+    {
+        TChain* chain = dynamic_cast<TChain*>(this->fChain);
+        if (chain)
+            std::cout << time_stamp()
+                      << ": Processing file \"" << chain->GetFile()->GetName()
+                      << '"' << std::endl;
+    }
+    return kTRUE;
+}
+
+
+template <class Options, class RootMadeClass>
+int ExampleAnalysis<Options,RootMadeClass>::beginJob()
+{
+    if (verbose_)
+        std::cout << "Analysis options are: " << options_ << std::endl;
+
+    bookManagedHistograms();
+
+    // Verify that all requested items (histograms, ntuples) were
+    // successfully created
+    return !manager_.verifyHistoRequests();
+}
+
+
+template <class Options, class RootMadeClass>
+int ExampleAnalysis<Options,RootMadeClass>::event(Long64_t entryNumber)
+{
+    // Sum up all visible energy
+    totalEnergy_ = 0.0;
+    for (Int_t i=0; i<this->PulseCount; ++i)
+        totalEnergy_ += this->energy(i);
+
+    fillManagedHistograms();
+    return 0;
+}
+
+
+template <class Options, class RootMadeClass>
+int ExampleAnalysis<Options,RootMadeClass>::endJob()
+{
+    return 0;
+}
+
+
+template <class Options, class RootMadeClass>
+void ExampleAnalysis<Options,RootMadeClass>::bookManagedHistograms()
+{
+    // In this method, we book histograms and ntuples which inherit
+    // from ManagedHisto and managed by HistogramManager. Management
+    // is established by calling the "manage" method of the HistogramManager.
+    // Managed histograms and ntuples will be automatically filled,
+    // written out, and eventually destroyed, so we don't have to do
+    // anything else about histograms themselves inside this class.
+    // We do, however, have to make sure that the manager's "AutoFill"
+    // and "CycleFill" methods are called as appropriate. This is done
+    // inside the "fillManagedHistograms" method which should be modified
+    // if you group your histograms in some non-trivial manner.
+
+    //
+    // Book a 1-d histogram. A detailed description of the "AutoH1D"
+    // arguments can be found inside "AutoH1D.h" header file. Same
+    // is true for all other histogram creation methods -- see the
+    // corresponding header file for documentation.
+    //
+    if (manager_.isRequested("BucketHisto"))
+        manager_.manage(AutoH1D("BucketHisto", "LHC fill structure",
+                                "1-d", "Bucket", "Events",
+                                3601, -0.5, 3600.5,
+                                ValueOf(this->Bunch), Double(1)));
+
+    //
+    // Book a 1-d histogram for a quantity which is determined inside
+    // the "event" function
+    //
+    if (manager_.isRequested("TotalEnergy"))
+        manager_.manage(AutoH1D("TotalEnergy",
+                         "Total HCAL energy",
+                         "1-d", "E", "Events",
+                         200, 0.0, 5000.0,
+                         ValueOf(this->totalEnergy_), Double(1)));
+
+    //
+    // Book a 2-d histogram
+    //
+    if (manager_.isRequested("Nhits_E"))
+        manager_.manage(AutoH2D("Nhits_E",
+                         "Number of HCAL hits and Energy",
+                         "2-d", "N Hits", "Energy", "Events",
+                         200, -0.5, 5184-0.5,
+                         200, 0.0, 5000.0,
+                         ValueOf(this->PulseCount),
+                         ValueOf(this->totalEnergy_), Double(1)));
+
+    //
+    // One can also book 3-d histograms in a similar manner.
+    // There will be four variable labels, three axis specifications,
+    // and three functors defining the quantities to histogram.
+    //
+
+    //
+    // Book a "cycled" 1-d histogram. Cycled histograms will be
+    // filled in a cycle over some array defined in the analysis
+    // tree. Note that there could be many such arrays of different
+    // lengths, so each of these different lengths should be placed
+    // into its own "group" (the last argument of the "manage"
+    // function, in this example "HBHE", which was omitted earlier).
+    //
+    if (manager_.isRequested("Energy"))
+        manager_.manage(CycledH1D("Energy",
+                           "Reconstructed energy of all channels",
+                           "Cycled 1-d", "E", "Channels",
+                           4200, -50.0, 1000.0,
+                           Method(&NoiseTreeHelper::energy, this),
+                           Double(1)), "HBHE");
+
+    //
+    // Book a "cycled" 2-d histogram. Note how the depth selection
+    // is performed -- with a boolean functor for the entry weight.
+    //
+    if (manager_.isRequested("ChannelOccupancyD1"))
+        manager_.manage(CycledH2D("ChannelOccupancyD1",
+                           "Channel occupancy at depth 1",
+                           "Cycled 2-d", "IEta", "IPhi", "Events",
+                           61, -30.5, 30.5,
+                           74, -0.5, 73.5,
+                           ElementOf(this->IEta), ElementOf(this->IPhi),
+                           ElementEQ(this->Depth, 1)), "HBHE");
+
+    //
+    // Book an ntuple to store results of various calculations.
+    //
+    // "TreeDatum" is just a macro which creates a corresponding
+    // column assuming that the variable with the given name exists
+    // in this class or in one of its bases.
+    //
+    if (manager_.isRequested("ResultNtuple"))
+        manager_.manage(AutoNtuple("ResultNtuple", "Result Ntuple", "Ntuples",
+                 std::make_tuple(
+                     TreeDatum(Bunch),
+                     Column("TotalEnergy", ValueOf(this->totalEnergy_)),
+                     TreeDatum(PulseCount)
+                 ), AllPass()));
+}
+
+
+template <class Options, class RootMadeClass>
+void ExampleAnalysis<Options,RootMadeClass>::fillManagedHistograms()
+{
+    // Don't forget to call the "AutoFill" and/or "CycleFill" methods
+    // of the manager. Managed histograms will be filled there.
+    manager_.AutoFill();
+    manager_.CycleFill(this->PulseCount, "HBHE", false);
+}

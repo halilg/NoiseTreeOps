@@ -1,0 +1,339 @@
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <algorithm>
+
+#include "AutoH1D.h"
+#include "AutoH2D.h"
+#include "AutoH3D.h"
+#include "AutoNtuple.h"
+
+#include "CycledH1D.h"
+#include "CycledH2D.h"
+#include "CycledH3D.h"
+#include "CycledNtuple.h"
+
+#include "CheckMask.h"
+#include "Functors.h"
+#include "time_stamp.h"
+#include "FFTJetChannelSelector.h"
+
+
+template <class Options, class RootMadeClass>
+SelectGoodChannels<Options,RootMadeClass>::SelectGoodChannels(
+    TTree *tree, const std::string& outputfile,
+    const std::set<std::string>& histoRequest,
+    const unsigned long maxEvents, const bool verbose,
+    const Options& opts)
+    : RootChainProcessor<RootMadeClass>(tree, maxEvents),
+      options_(opts),
+      verbose_(verbose),
+      manager_(outputfile, histoRequest),
+      channelGeometry_(opts.hbGeometryFile.c_str(),
+                       opts.heGeometryFile.c_str()),
+      channelSelector_(0),
+      channelSelectionMask_(HBHEChannelMap::ChannelCount, 1U),
+      eventCounter_(0),
+      channelCounter_(0)
+{
+    // Initialize channel selector
+    if (opts.channelSelector == "FFTJetChannelSelector")
+    {
+        const unsigned nPhiBins = 128;
+        const unsigned nEtaBins = 256;
+        const double etaMax = 2.0*M_PI;
+        const double etaMin = -etaMax;
+        channelSelector_ = new FFTJetChannelSelector<MyType>(
+            channelGeometry_, nEtaBins, etaMin, etaMax, nPhiBins,
+            opts.pattRecoScale, opts.etaToPhiBandwidthRatio,
+            opts.coneSize, opts.peakEtCutoff, opts.jetPtCutoff,
+            opts.etFractionCutoff);
+    }
+    else if (opts.channelSelector == "AllChannelSelector")
+        channelSelector_ = new AllChannelSelector<MyType>();
+    else
+    {
+        std::ostringstream os;
+        os << "In SelectGoodChannels constructor: unsupported channel "
+           << "selector class \"" << opts.channelSelector << '"';
+        throw std::invalid_argument(os.str());
+    }
+
+    this->setEMinMaxTS(options_.minResponseTS, options_.maxResponseTS);
+}
+
+
+template <class Options, class RootMadeClass>
+SelectGoodChannels<Options,RootMadeClass>::~SelectGoodChannels()
+{
+    delete channelSelector_;
+}
+
+
+template <class Options, class RootMadeClass>
+Int_t SelectGoodChannels<Options,RootMadeClass>::Cut(Long64_t /* entry */)
+{
+    // return  1 if entry is accepted.
+    // return -1 otherwise.
+    // if (this->NumberOfGoodPrimaryVertices > 0 &&
+    //    this->NumberOfGoodTracks > 0)
+        return 1;
+    // else
+    //  return -1;
+}
+
+
+template <class Options, class RootMadeClass>
+Bool_t SelectGoodChannels<Options,RootMadeClass>::Notify()
+{
+    // The Notify() function is called when a new file is opened. This
+    // can be either for a new TTree in a TChain or when when a new TTree
+    // is started when using PROOF.
+    if (verbose_)
+    {
+        TChain* chain = dynamic_cast<TChain*>(this->fChain);
+        assert(chain);
+        std::cout << time_stamp()
+                  << ": Processing file \"" << chain->GetFile()->GetName()
+                  << '"' << std::endl;
+    }
+    return kTRUE;
+}
+
+
+template <class Options, class RootMadeClass>
+int SelectGoodChannels<Options,RootMadeClass>::beginJob()
+{
+    eventCounter_ = 0;
+    channelCounter_ = 0;
+
+    if (verbose_)
+        std::cout << "Analysis options are: " << options_ << std::endl;
+
+    // Book histograms
+    bookManagedHistograms();
+
+    // Verify that all requested items (histograms, ntuples) were
+    // successfully created
+    return !manager_.verifyHistoRequests();
+}
+
+
+template <class Options, class RootMadeClass>
+int SelectGoodChannels<Options,RootMadeClass>::event(Long64_t entryNumber)
+{
+    if (verbose_ && eventCounter_ % 100 == 0)
+        std::cout << time_stamp()
+                  << " : processing event " << eventCounter_
+                  << std::endl;
+
+    // Cycle over channel data and fill some useful info
+    for (Int_t i=0; i<this->PulseCount; ++i)
+    {
+        // Determine and remember the channel number for the given "pulse"
+        const unsigned chNum = channelMap_.linearIndex(
+            this->Depth[i], this->IEta[i], this->IPhi[i]);
+        assert(chNum < HBHEChannelMap::ChannelCount);
+        channelNumber_[i] = chNum;
+
+        const double* charge = &this->Charge[i][0];
+
+        channelCharge_[i] = std::accumulate(
+            charge+options_.minResponseTS, charge+options_.maxResponseTS, 0.0);
+    }
+
+    // Select "good" channels with the channel selector
+    assert(channelSelector_);
+    channelSelector_->select(*this, &channelSelectionMask_, &parentObjectPt_);
+
+    // Fill jet summary (this will do something only in case
+    // the jet reconstruction was rerun)
+    fillJetSummary(&jetSummary_);
+
+    // Add the "RecHitTime" selection
+    // for (Int_t i=0; i<this->PulseCount; ++i)
+    //    if (!(this->RecHitTime[i] > options_.minRecHitTime &&
+    //          this->RecHitTime[i] < options_.maxRecHitTime))
+    //        channelSelectionMask_[i] = 0;
+
+    fillManagedHistograms();
+    ++eventCounter_;
+    channelCounter_ += static_cast<unsigned>(this->PulseCount);
+    return 0;
+}
+
+
+template <class Options, class RootMadeClass>
+int SelectGoodChannels<Options,RootMadeClass>::endJob()
+{
+    if (verbose_)
+        std::cout << "Processed " << channelCounter_
+                  << " channels in this analysis" << std::endl;
+
+    return 0;
+}
+
+
+template <class Options, class RootMadeClass>
+void SelectGoodChannels<Options,RootMadeClass>::bookManagedHistograms()
+{
+    // In this method, we book histograms and ntuples which inherit
+    // from ManagedHisto and managed by HistogramManager. Management
+    // is established by calling the "manage" method of the HistogramManager.
+    // Managed histograms and ntuples will be automatically filled,
+    // written out, and eventually destroyed, so we don't have to do
+    // anything else about histograms themselves inside this class.
+    // We do, however, have to make sure that the manager's "AutoFill"
+    // and "CycleFill" methods are called as appropriate. This is done
+    // inside the "fillManagedHistograms" method which should be modified
+    // if you group your histograms in some non-trivial manner.
+
+    if (manager_.isRequested("EventCount"))
+        manager_.manage(AutoH1D("EventCount", "Event count as a histogram",
+                                "1-d", "Dummy", "Events",
+                                1, 0.0, 1.0, Double(0.5), Double(1)));
+
+    if (manager_.isRequested("BucketHisto"))
+        manager_.manage(AutoH1D("BucketHisto", "LHC fill structure",
+                                "1-d", "Bucket", "Events",
+                                3601, -0.5, 3600.5,
+                                ValueOf(this->Bunch), Double(1)));
+
+    //
+    // Jet Pt histogram. Will use the group "Jets" and
+    // will have one entry per jet.
+    //
+    FFTJetChannelSelector<MyType>* sel = 
+        dynamic_cast<FFTJetChannelSelector<MyType>*>(channelSelector_);
+    if (sel && manager_.isRequested("JetPtHisto"))
+        manager_.manage(CycledH1D("JetPtHisto", "Pt of the reconstructed jets",
+                                  "Jets", "Jet Pt", "N Jets",
+                                  250, 0.0, 250.0,
+                                  Method(&FFTJetChannelSelector<MyType>::getJetPt, sel),
+                                  Double(1)), "Jets");
+
+    //
+    // Jet Eta histogram
+    //
+    if (sel && manager_.isRequested("JetEtaHisto"))
+        manager_.manage(CycledH1D("JetEtaHisto", "Eta of the reconstructed jets",
+                                  "Jets", "Jet Eta", "N Jets",
+                                  80, -4.0, 4.0,
+                                  Method(&FFTJetChannelSelector<MyType>::getJetEta, sel),
+                                  Double(1)), "Jets");
+
+    //
+    // A simple ntuple for studying channel selector based on jet reconstruction,
+    // with one entry per event.
+    //
+    if (sel && manager_.isRequested("JetNtuple"))
+        manager_.manage(AutoNtuple("JetNtuple", "Jet Summary Ntuple", "",
+                 std::make_tuple(
+                     Column("FFTJetsMade",        ValueOf(jetSummary_.NJetsMade)),
+                     Column("FFTJetsUsed",        ValueOf(jetSummary_.NJetsUsed)),
+                     Column("FFTJetCount20",      ValueOf(jetSummary_.JetCount20)),
+                     Column("FFTJetCount30",      ValueOf(jetSummary_.JetCount30)),
+                     Column("FFTJetCount50",      ValueOf(jetSummary_.JetCount50)),
+                     Column("FFTJetCount100",     ValueOf(jetSummary_.JetCount100)),
+                     Column("FFTLeadingJetEta",   ValueOf(jetSummary_.LeadingJetEta)),
+                     Column("FFTLeadingJetPhi",   ValueOf(jetSummary_.LeadingJetPhi)),
+                     Column("FFTLeadingJetPt",    ValueOf(jetSummary_.LeadingJetPt)),
+                     Column("FFTFollowingJetEta", ValueOf(jetSummary_.FollowingJetEta)),
+                     Column("FFTFollowingJetPhi", ValueOf(jetSummary_.FollowingJetPhi)),
+                     Column("FFTFollowingJetPt",  ValueOf(jetSummary_.FollowingJetPt)),
+                     Column("FFTEtSum",           ValueOf(jetSummary_.EtSum)),
+                     Column("FFTEtFractionUsed",  ValueOf(jetSummary_.EtFractionUsed))
+                 )));
+
+    //
+    // Managed histograms and ntuples in the HBHE group.
+    // These items will be filled "PulseCount" times per event.
+    //
+    if (manager_.isRequested("ChannelQNtuple"))
+         manager_.manage(CycledNtuple("ChannelQNtuple",
+                                      "Channel Charge", "HBHE",
+             std::make_tuple(
+                 Column("ChannelNumber",   ElementOf(channelNumber_)),
+                 Column("IEta",            ElementOf(this->IEta)),
+                 Column("IPhi",            ElementOf(this->IPhi)),
+                 Column("Depth",           ElementOf(this->Depth)),
+                 Column("Energy",          Method(&NoiseTreeHelper::energy, this)),
+                 Column("selected",        ElementOf(channelSelectionMask_)),
+                 Column("jetHadPt",        ElementOf(parentObjectPt_)),
+                 Column("charge",          ElementOf(channelCharge_)),
+                 Column("ts0",             ElementOf(&this->Charge[0][0], 10)),
+                 Column("ts1",             ElementOf(&this->Charge[0][1], 10)),
+                 Column("ts2",             ElementOf(&this->Charge[0][2], 10)),
+                 Column("ts3",             ElementOf(&this->Charge[0][3], 10)),
+                 Column("ts4",             ElementOf(&this->Charge[0][4], 10)),
+                 Column("ts5",             ElementOf(&this->Charge[0][5], 10)),
+                 Column("ts6",             ElementOf(&this->Charge[0][6], 10)),
+                 Column("ts7",             ElementOf(&this->Charge[0][7], 10)),
+                 Column("ts8",             ElementOf(&this->Charge[0][8], 10)),
+                 Column("ts9",             ElementOf(&this->Charge[0][9], 10))
+             ), CheckMask(&channelSelectionMask_, options_.storeSelectedOnly)), "HBHE");
+}
+
+
+template <class Options, class RootMadeClass>
+void SelectGoodChannels<Options,RootMadeClass>::fillManagedHistograms()
+{
+    // Don't forget to call the "AutoFill" and, possibly, "CycleFill"
+    // methods of the manager. Managed histograms will be filled there.
+    manager_.AutoFill();
+    manager_.CycleFill(this->PulseCount, "HBHE", false);
+    FFTJetChannelSelector<MyType>* sel = 
+        dynamic_cast<FFTJetChannelSelector<MyType>*>(channelSelector_);
+    if (sel)
+        manager_.CycleFill(sel->nGoodJets(), "Jets", false);
+}
+
+
+template <class Options, class RootMadeClass>
+void SelectGoodChannels<Options,RootMadeClass>::fillJetSummary(
+    JetSummary* summary)
+{
+    typedef typename FFTJetChannelSelector<MyType>::Jet Jet;
+
+    FFTJetChannelSelector<MyType>* sel = 
+        dynamic_cast<FFTJetChannelSelector<MyType>*>(channelSelector_);
+    if (sel)
+    {
+        static const JetSummary dummySummary;
+        assert(summary);
+        *summary = dummySummary;
+
+        const std::vector<Jet>& jets(sel->getJets());
+        summary->NJetsMade = jets.size();
+        summary->NJetsUsed = sel->nGoodJets();
+        for (unsigned i=0; i<summary->NJetsMade; ++i)
+        {
+            const double pt = jets[i].vec().Pt();
+            if (pt > 20.0)
+                summary->JetCount20++;
+            if (pt > 30.0)
+                summary->JetCount30++;
+            if (pt > 50.0)
+                summary->JetCount50++;
+            if (pt > 100.0)
+                summary->JetCount100++;
+        }
+        if (summary->NJetsMade > 0)
+        {
+            const VectorLike& p4(jets[0].vec());
+            summary->LeadingJetEta = p4.Eta();
+            summary->LeadingJetPhi = p4.Phi();
+            summary->LeadingJetPt = p4.Pt();
+        }
+        if (summary->NJetsMade > 1)
+        {
+            const VectorLike& p4(jets[1].vec());
+            summary->FollowingJetEta = p4.Eta();
+            summary->FollowingJetPhi = p4.Phi();
+            summary->FollowingJetPt = p4.Pt();
+        }
+        summary->EtSum = sel->sumEt();
+        if (summary->EtSum > 0.0)
+            summary->EtFractionUsed = (summary->EtSum - sel->unusedEt())/summary->EtSum;
+    }
+}
